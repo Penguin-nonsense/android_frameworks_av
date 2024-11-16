@@ -388,8 +388,31 @@ private:
 
     int32_t mDoviProfile;
 
+    // indicates if the video is MV-HEVC or not
+    bool mIsMvHevc;
+
     void *mCodecSpecificData;
     size_t mCodecSpecificDataSize;
+
+    // for MV-HEVC (LHVC box)
+    void *mMvHevcSpecificData;
+    size_t mMvHevcSpecificDataSize;
+    // for Stereo ISO-BMFF mandatory information (stri box)
+    void *mStereoSpecificData;
+    size_t mStereoSpecificDataSize;
+    // for Hero eye ISO-BMFF information (hero box)
+    void *mHeroEyeData;
+    size_t mHeroEyeDataSize;
+    // for Stereo Camera baseline information (blin box)
+    void *mBaselineDistanceData;
+    size_t mBaselineDistanceDataSize;
+    // for Stereo Display Adjustment information (dadj box)
+    void *mStereoDispAdjData;
+    size_t mStereoDispAdjDataSize;
+    // for Horizontal Field of View information (hfov box)
+    void *mHorizFieldOfViewData;
+    size_t mHorizFieldOfViewDataSize;
+
     bool mGotAllCodecSpecificData;
     bool mTrackingProgressStatus;
 
@@ -439,6 +462,11 @@ private:
     status_t parseHEVCCodecSpecificData(
             const uint8_t *data, size_t size, HevcParameterSets &paramSets);
 
+    // Supplimentary information for MV-HEVC
+    void setBlinData(uint32_t *data);
+    void setDadjData(uint32_t *data);
+    void setHfovData(uint32_t *data);
+
     status_t getDolbyVisionProfile();
 
     status_t parseMHASPackets(MediaBufferBase *buffer);
@@ -479,6 +507,12 @@ private:
     void writePaspBox();
     void writeAvccBox();
     void writeHvccBox();
+
+    // additional boxes for MV-HEVC
+    void writeLhvcBox();
+    void writeVexuBox();
+    void writeHfovBox();
+
     void writeAv1cBox();
     void writeDoviConfigBox();
     void writeUrlBox();
@@ -676,6 +710,8 @@ const char *MPEG4Writer::Track::getFourCCForMime(const char *mime) {
         } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mime)) {
             return "avc1";
         } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_HEVC, mime)) {
+            return "hvc1";
+        } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_MVHEVC, mime)) {
             return "hvc1";
         } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_AV1, mime)) {
             return "av01";
@@ -2246,8 +2282,21 @@ MPEG4Writer::Track::Track(
       mMinCttsOffsetTicks(0),
       mMaxCttsOffsetTicks(0),
       mDoviProfile(0),
+      mIsMvHevc(0),
       mCodecSpecificData(NULL),
       mCodecSpecificDataSize(0),
+      mMvHevcSpecificData(NULL),
+      mMvHevcSpecificDataSize(0),
+      mStereoSpecificData(NULL),
+      mStereoSpecificDataSize(0),
+      mHeroEyeData(NULL),
+      mHeroEyeDataSize(0),
+      mBaselineDistanceData(NULL),
+      mBaselineDistanceDataSize(0),
+      mStereoDispAdjData(NULL),
+      mStereoDispAdjDataSize(0),
+      mHorizFieldOfViewData(NULL),
+      mHorizFieldOfViewDataSize(0),
       mGotAllCodecSpecificData(false),
       mReachedEOS(false),
       mStartTimestampUs(-1),
@@ -2272,6 +2321,7 @@ MPEG4Writer::Track::Track(
     mMeta->findCString(kKeyMIMEType, &mime);
     mIsAvc = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC);
     mIsHevc = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_HEVC);
+    mIsMvHevc = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_MVHEVC);
     mIsAv1 = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AV1);
     mIsDovi = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_DOLBY_VISION);
     mIsAudio = !strncasecmp(mime, "audio/", 6);
@@ -2765,7 +2815,30 @@ MPEG4Writer::Track::~Track() {
         free(mCodecSpecificData);
         mCodecSpecificData = NULL;
     }
-
+    if (mMvHevcSpecificData != NULL) {
+        free(mMvHevcSpecificData);
+        mMvHevcSpecificData = NULL;
+    }
+    if (mStereoSpecificData != NULL) {
+        free(mStereoSpecificData);
+        mStereoSpecificData = 0;
+    }
+    if (mHeroEyeData != NULL) {
+        free(mHeroEyeData);
+        mHeroEyeDataSize = 0;
+    }
+    if (mBaselineDistanceData != NULL) {
+        free(mBaselineDistanceData);
+        mBaselineDistanceDataSize = 0;
+    }
+    if (mStereoDispAdjData != NULL) {
+        free(mStereoDispAdjData);
+        mStereoDispAdjDataSize = 0;
+    }
+    if (mHorizFieldOfViewData != NULL) {
+        free(mHorizFieldOfViewData);
+        mHorizFieldOfViewData = 0;
+    }
 }
 
 void MPEG4Writer::Track::initTrackingProgressStatus(MetaData *params) {
@@ -3415,33 +3488,69 @@ status_t MPEG4Writer::Track::parseHEVCCodecSpecificData(
             tmp = nextStartCode;
         }
     }
+    const bool isMvHevc = paramSets.IsMvHevc();
+    const size_t numLayers = isMvHevc? 2 : 1;
 
     size_t csdSize = 23;
+    size_t csdSizeMvHevc = 6;
     const size_t numNalUnits = paramSets.getNumNalUnits();
     for (size_t i = 0; i < ARRAY_SIZE(kMandatoryHevcNalUnitTypes); ++i) {
-        int type = kMandatoryHevcNalUnitTypes[i];
-        size_t numParamSets = paramSets.getNumNalUnitsOfType(type);
-        if (numParamSets == 0) {
-            ALOGE("Cound not find NAL unit of type %d", type);
-            return ERROR_MALFORMED;
+        // MV-HEVC : find any parameter set whose nuh_layer_id > 0
+        for (size_t layer = 0; layer < numLayers; ++layer) {
+            int type = kMandatoryHevcNalUnitTypes[i];
+            if (type == 32 && layer > 0) {
+                continue; // Only one VPS is expected in the bitstream.
+            }
+            size_t numParamSets = paramSets.getNumNalUnitsOfType(type, layer);
+            if (numParamSets == 0 && layer == 0) {
+                ALOGE("Cound not find NAL unit of type %d", type);
+                return ERROR_MALFORMED;
+            } else if (isMvHevc && numParamSets == 0 && type != kHevcNalUnitTypeVps
+                && layer == 1) {
+                // for the Nal units nuh_layer_id > 0, VPS is not mandatory
+                ALOGE("Could not find NAL unit of type %d", type);
+                return ERROR_MALFORMED;
+            }
         }
     }
     for (size_t i = 0; i < ARRAY_SIZE(kHevcNalUnitTypes); ++i) {
         int type = kHevcNalUnitTypes[i];
-        size_t numParamSets = paramSets.getNumNalUnitsOfType(type);
-        if (numParamSets > 0xffff) {
-            ALOGE("Too many seq parameter sets (%zu) found", numParamSets);
-            return ERROR_MALFORMED;
-        }
-        csdSize += 3;
-        for (size_t j = 0; j < numNalUnits; ++j) {
-            if (paramSets.getType(j) != type) {
-                continue;
+        for (size_t layer = 0; layer < numLayers; ++layer) {
+            size_t numParamSets = paramSets.getNumNalUnitsOfType(type, layer);
+            if (numParamSets > 0xffff) {
+                ALOGE("Too many seq parameter sets (%zu) found", numParamSets);
+                return ERROR_MALFORMED;
             }
-            csdSize += 2 + paramSets.getSize(j);
+            switch (layer) {
+                case 0 :
+                    csdSize += 3;
+                    for (size_t j = 0; j < numNalUnits; ++j) {
+                        if (paramSets.getType(j) != type) {
+                            continue;
+                        }
+                        csdSize += 2 + paramSets.getSize(j);
+                    }
+                    break;
+                case 1 :
+                    csdSizeMvHevc += 3;
+                    for (size_t j = 0; j < numNalUnits; ++j) {
+                        if ((paramSets.getType(j) != type)
+                            || (type == kHevcNalUnitTypeVps)) {
+                            continue;
+                        }
+                        csdSizeMvHevc += 2 + paramSets.getSize(j);
+                    }
+                    break;
+                default :
+                    break;
+            }
         }
     }
     mCodecSpecificDataSize = csdSize;
+    if (isMvHevc) {
+        mMvHevcSpecificDataSize = csdSizeMvHevc;
+        mStereoSpecificDataSize = 1;
+    }
     return OK;
 }
 
@@ -3482,6 +3591,37 @@ status_t MPEG4Writer::Track::makeHEVCCodecSpecificData(
         return err;
     }
 
+    // memory allocation for MV-HEVC
+    if (paramSets.IsMvHevc())
+    {
+        mMvHevcSpecificData = malloc(mMvHevcSpecificDataSize);
+        if (mMvHevcSpecificData == NULL) {
+            mMvHevcSpecificDataSize = 0;
+            return NO_MEMORY;
+        }
+
+        status_t err = paramSets.makeLhvc((uint8_t *)mMvHevcSpecificData,
+                &mMvHevcSpecificDataSize, mOwner->useNalLengthFour() ? 4 : 2);
+        if (err != OK) {
+            ALOGE("failed constructing LHVC atom");
+            return err;
+        }
+
+        mStereoSpecificData = malloc(mStereoSpecificDataSize);
+        if (mStereoSpecificData == NULL) {
+            return NO_MEMORY;
+        }
+        paramSets.makeStri((uint8_t*)mStereoSpecificData);
+
+        mHeroEyeDataSize = 1; // this data is defined as an unsigned 32-bit ingeter
+        mHeroEyeData = malloc(mHeroEyeDataSize);
+        if (mHeroEyeData == NULL) {
+            return NO_MEMORY;
+        }
+        paramSets.makeHero((uint8_t*)mHeroEyeData);
+
+        mIsMvHevc = true;
+    }
     return OK;
 }
 
@@ -3530,6 +3670,7 @@ uint32_t parseEscaped(ABitReader &br, uint32_t bits1 = 0,
   }
   return value;
 }
+
 status_t MPEG4Writer::Track::parseMHASPackets(MediaBufferBase *buffer) {
     const uint8_t* data = (const uint8_t*)buffer->data();
     size_t size = buffer->size();
@@ -3696,7 +3837,7 @@ status_t MPEG4Writer::Track::threadEntry() {
                             (const uint8_t *)buffer->data()
                                 + buffer->range_offset(),
                             buffer->range_length());
-                } else if (mIsHevc || mIsHeic) {
+                } else if (mIsHevc || mIsHeic || mIsMvHevc) {
                     err = makeHEVCCodecSpecificData(
                             (const uint8_t *)buffer->data()
                                 + buffer->range_offset(),
@@ -4249,6 +4390,51 @@ bool MPEG4Writer::Track::isTrackMalFormed() {
     return false;
 }
 
+void MPEG4Writer::Track::setBlinData(uint32_t *data) {
+    ALOGV("setBlinData()");
+    mBaselineDistanceDataSize = 4;
+    mBaselineDistanceData = malloc(mBaselineDistanceDataSize);
+    if (mBaselineDistanceData == NULL) {
+        ALOGE("Error no memory to set Baseline Distance Data");
+        return;
+    }
+    uint8_t *ptr = (uint8_t*)mBaselineDistanceData;
+    ptr[0] = (*data & 0xff000000) >> 24;
+    ptr[1] = (*data & 0x00ff0000) >> 16;
+    ptr[2] = (*data & 0x0000ff00) >> 8;
+    ptr[3] = *data & 0x000000ff;
+}
+
+void MPEG4Writer::Track::setDadjData(uint32_t *data) {
+    ALOGV("setDadjData()");
+    mStereoDispAdjDataSize = 4;
+    mStereoDispAdjData = malloc(mStereoDispAdjDataSize);
+    if (mStereoDispAdjData == NULL) {
+        ALOGE("Error no memory to set Stereo Adjust Data");
+        return;
+    }
+    uint8_t *ptr = (uint8_t*)mStereoDispAdjData;
+    ptr[0] = (*data & 0xff000000) >> 24;
+    ptr[1] = (*data & 0x00ff0000) >> 16;
+    ptr[2] = (*data & 0x0000ff00) >> 8;
+    ptr[3] = *data & 0x000000ff;
+}
+
+void MPEG4Writer::Track::setHfovData(uint32_t *data) {
+    ALOGV("setHfovData()");
+    mHorizFieldOfViewDataSize = 4;
+    mHorizFieldOfViewData = malloc(mHorizFieldOfViewDataSize);
+    if (mHorizFieldOfViewData == NULL) {
+        ALOGE("Error no memory to set Horiz Field Of View Data");
+        return;
+    }
+    uint8_t *ptr = (uint8_t*)mHorizFieldOfViewData;
+    ptr[0] = (*data & 0xff000000) >> 24;
+    ptr[1] = (*data & 0x00ff0000) >> 16;
+    ptr[2] = (*data & 0x0000ff00) >> 8;
+    ptr[3] = *data & 0x000000ff;
+}
+
 void MPEG4Writer::Track::sendTrackSummary(bool hasMultipleTracks) {
 
     // Send track summary only if test mode is enabled.
@@ -4437,6 +4623,7 @@ status_t MPEG4Writer::Track::checkCodecSpecificData() const {
         !strcasecmp(MEDIA_MIMETYPE_VIDEO_MPEG4, mime) ||
         !strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mime) ||
         !strcasecmp(MEDIA_MIMETYPE_VIDEO_HEVC, mime) ||
+        !strcasecmp(MEDIA_MIMETYPE_VIDEO_MVHEVC, mime) ||
         !strcasecmp(MEDIA_MIMETYPE_VIDEO_AV1, mime) ||
         !strcasecmp(MEDIA_MIMETYPE_VIDEO_DOLBY_VISION, mime) ||
         !strcasecmp(MEDIA_MIMETYPE_IMAGE_ANDROID_HEIC, mime) ||
@@ -4610,6 +4797,11 @@ void MPEG4Writer::Track::writeVideoFourCCBox() {
         writeAvccBox();
     } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_HEVC, mime)) {
         writeHvccBox();
+    } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_MVHEVC, mime)) {
+        writeHvccBox();
+        if (mIsMvHevc) {
+            writeLhvcBox();
+        }
     } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_AV1, mime)) {
         writeAv1cBox();
     } else if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_DOLBY_VISION, mime)) {
@@ -4625,6 +4817,10 @@ void MPEG4Writer::Track::writeVideoFourCCBox() {
 
     writePaspBox();
     writeColrBox();
+    if (mIsMvHevc) {
+        writeVexuBox();
+        writeHfovBox();
+    }
     writeMdcvAndClliBoxes();
     mOwner->endBox();  // mp4v, s263 or avc1
 }
@@ -4877,6 +5073,7 @@ void MPEG4Writer::Track::writeMp4vEsdsBox() {
 
     mOwner->endBox();  // esds
 }
+
 void MPEG4Writer::Track::writeMhaCBox() {
     mOwner->beginBox("mhaC");
     mOwner->writeInt8(0x01);          // version=1
@@ -5191,6 +5388,92 @@ void MPEG4Writer::Track::writeHvccBox() {
     mOwner->beginBox("hvcC");
     mOwner->write(mCodecSpecificData, mCodecSpecificDataSize);
     mOwner->endBox();  // hvcC
+}
+
+void MPEG4Writer::Track::writeLhvcBox() {
+    ALOGV("writing lhvc box");
+    // To be modified properly
+
+    CHECK(mMvHevcSpecificData);
+
+    // Patch hvcc's lengthSize field to match the number
+    // of bytes we use to indicate the size of a nal unit.
+    uint8_t *ptr = (uint8_t *)mMvHevcSpecificData;
+    ptr[21] = (ptr[21] & 0xfc) | (mOwner->useNalLengthFour() ? 3 : 1);
+    mOwner->beginBox("lhvC");
+    mOwner->write(mMvHevcSpecificData, mMvHevcSpecificDataSize);
+    mOwner->endBox();  // lhvc
+}
+
+void MPEG4Writer::Track::writeVexuBox() {
+    ALOGV("writing vexu box");
+    // To be modified properly
+
+    // FIXME : device-dependent information should be included
+    // mime type : blin, dadj (not mandatory)
+    // please refer to the website https://blog.mikeswanson.com/spatial-video
+    // or Stereo-Video-ISOBMFF Version 0.9 (June 21, 2023)
+    CHECK(mStereoSpecificData);
+    if (mStereoSpecificDataSize == 1) {
+        uint8_t *ptr = (uint8_t*)mStereoSpecificData;
+        mOwner->beginBox("vexu");
+        mOwner->beginBox("eyes"); // container only
+        mOwner->beginBox("stri");
+        mOwner->writeInt32(0); // stri extends FullBox, version=0 (8), flags=0 (24)
+        mOwner->write(mStereoSpecificData, mStereoSpecificDataSize);
+        mOwner->endBox();  // stri
+        mOwner->beginBox("hero");
+        mOwner->writeInt32(0); // hero extends FullBox, version=0 (8), flags=0 (24)
+        mOwner->write(mHeroEyeData, mHeroEyeDataSize);
+        mOwner->endBox(); //hero
+        mOwner->beginBox("cams"); // container only
+        mOwner->beginBox("blin");
+        mOwner->writeInt32(0); // blin extends FullBox, version=0 (8), flags=0 (24)
+        if (mBaselineDistanceDataSize) {
+            mOwner->write(mBaselineDistanceData, mBaselineDistanceDataSize);
+        } else {
+            uint8_t tmp[4] = {0, 0, 0, 0};
+            size_t size = 4;
+            mOwner->write(tmp, size);
+        }
+        mOwner->endBox(); //blin
+        mOwner->endBox(); //cams
+        mOwner->beginBox("cmfy"); // container only
+        mOwner->beginBox("dadj");
+        mOwner->writeInt32(0); // blin extends FullBox, version=0 (8), flags=0 (24)
+        if (mStereoDispAdjDataSize) {
+            mOwner->write(mStereoDispAdjData, mStereoDispAdjDataSize);
+        } else {
+            uint8_t tmp[4] = {0, 0, 0, 0};
+            size_t size = 4;
+            mOwner->write(tmp, size);
+        }
+        mOwner->endBox(); //dadj
+        mOwner->endBox(); //cmfy
+        mOwner->endBox(); //eyes
+        mOwner->beginBox("proj"); // container only
+        mOwner->beginBox("prji");
+        mOwner->beginBox("rect"); // this fourCC is fixed (standard stereo video)
+        mOwner->endBox();  // rect
+        mOwner->endBox();  // prji
+        mOwner->endBox();  // stbl
+        mOwner->endBox();  // vexu
+    }
+}
+
+void MPEG4Writer::Track::writeHfovBox() {
+    ALOGV("writing Hfov box");
+    // To be modified properly
+    mOwner->beginBox("hfov");
+    if (mHorizFieldOfViewDataSize == 4) {
+        uint8_t *ptr = (uint8_t*)mHorizFieldOfViewData;
+        mOwner->write(mHorizFieldOfViewData, mHorizFieldOfViewDataSize);
+    } else {
+        uint8_t tmp[4] = {0, 0, 0, 0};
+        size_t size = 4;
+        mOwner->write(tmp, size);
+    }
+    mOwner->endBox();  // hfov
 }
 
 void MPEG4Writer::Track::writeAv1cBox() {

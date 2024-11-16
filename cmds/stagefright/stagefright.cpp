@@ -749,7 +749,9 @@ static void dumpCodecDetails(bool queryDecoders) {
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_VP8)   ? asString_VP8Profile(pl.mProfile) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_HEVC)  ? asString_HEVCProfile(pl.mProfile) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_VP9)   ? asString_VP9Profile(pl.mProfile) :
-                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_AV1)   ? asString_AV1Profile(pl.mProfile) :"??";
+                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_AV1)   ? asString_AV1Profile(pl.mProfile) :
+                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_MVHEVC) ? asString_HEVCProfile(pl.mProfile) :
+                        "??";
                     const char *niceLevel =
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_MPEG2) ? asString_MPEG2Level(pl.mLevel) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_H263)  ? asString_H263Level(pl.mLevel) :
@@ -759,6 +761,7 @@ static void dumpCodecDetails(bool queryDecoders) {
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_HEVC)  ? asString_HEVCTierLevel(pl.mLevel) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_VP9)   ? asString_VP9Level(pl.mLevel) :
                         mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_AV1)   ? asString_AV1Level(pl.mLevel) :
+                        mediaType.equalsIgnoreCase(MIMETYPE_VIDEO_MVHEVC) ? asString_HEVCTierLevel(pl.mLevel) :
                         "??";
 
                     list.add(AStringPrintf("% 5u/% 5u (%s/%s)",

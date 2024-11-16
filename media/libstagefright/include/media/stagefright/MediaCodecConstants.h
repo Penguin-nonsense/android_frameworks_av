@@ -716,6 +716,7 @@ inline constexpr char MIMETYPE_VIDEO_MPEG2[] = "video/mpeg2";
 inline constexpr char MIMETYPE_VIDEO_RAW[] = "video/raw";
 inline constexpr char MIMETYPE_VIDEO_DOLBY_VISION[] = "video/dolby-vision";
 inline constexpr char MIMETYPE_VIDEO_SCRAMBLED[] = "video/scrambled";
+inline constexpr char MIMETYPE_VIDEO_MVHEVC[] = "video/x-mvhevc";
 
 inline constexpr char MIMETYPE_AUDIO_AMR_NB[] = "audio/3gpp";
 inline constexpr char MIMETYPE_AUDIO_AMR_WB[] = "audio/amr-wb";

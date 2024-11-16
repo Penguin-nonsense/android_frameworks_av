@@ -55,6 +55,7 @@ status_t HevcParameterSets::addNalUnit(const uint8_t* data, size_t size) {
         return ERROR_MALFORMED;
     }
     uint8_t nalUnitType = (data[0] >> 1) & 0x3f;
+    uint8_t nuhLayerId = ((data[0] & 0x01) << 5) | ((data[1] >> 3) & 0x1f);
     status_t err = OK;
     switch (nalUnitType) {
         case 32:  // VPS
@@ -69,19 +70,19 @@ status_t HevcParameterSets::addNalUnit(const uint8_t* data, size_t size) {
                 ALOGE("invalid NAL/SPS size b/35467107");
                 return ERROR_MALFORMED;
             }
-            err = parseSps(data + 2, size - 2);
+            err = parseSps(data + 2, size - 2, nuhLayerId);
             break;
         case 34:  // PPS
             if (size < 2) {
                 ALOGE("invalid NAL/PPS size b/35467107");
                 return ERROR_MALFORMED;
             }
-            err = parsePps(data + 2, size - 2);
+            err = parsePps(data + 2, size - 2, nuhLayerId);
             break;
         case 35:  // AUD
         case 39:  // Prefix SEI
         case 40:  // Suffix SEI
-            // Ignore
+            err = parseSeiMessage(data + 2, size - 2);
             break;
         default:
             ALOGE("Unrecognized NAL unit type.");
@@ -89,13 +90,20 @@ status_t HevcParameterSets::addNalUnit(const uint8_t* data, size_t size) {
     }
 
     if (err != OK) {
-        ALOGE("error parsing VPS or SPS or PPS");
+        ALOGE("error parsing VPS or SPS or PPS or SEI");
         return err;
     }
 
     sp<ABuffer> buffer = ABuffer::CreateAsCopy(data, size);
     buffer->setInt32Data(nalUnitType);
     mNalUnits.push(buffer);
+    // nal unit layer id
+    mNalLayerIds.push(nuhLayerId);
+    if (mNalUnits.size() != mNalLayerIds.size()) {
+        ALOGE("mNalUnits.size():%d, mNalLayerIds.size():%d",
+        mNalUnits.size(), mNalLayerIds.size());
+        return ERROR_MALFORMED;
+    }
     return OK;
 }
 
@@ -127,6 +135,20 @@ bool HevcParameterSets::findParam64(uint32_t key, uint64_t *param) {
     return findParam(key, param, mParams);
 }
 
+size_t HevcParameterSets::getNumNalUnitsOfType(uint8_t type, uint8_t layerId) {
+    size_t num = 0;
+    if (mNalUnits.size() != mNalLayerIds.size()) {
+        ALOGE("the number of Nal units and their corresponding layer Ids do not match");
+        return num;
+    }
+
+    for (size_t i = 0; i < mNalUnits.size(); ++i) {
+        if (getType(i) == type && getLayerId(i) == layerId) {
+            ++num;
+        }
+    }
+    return num;
+}
 size_t HevcParameterSets::getNumNalUnitsOfType(uint8_t type) {
     size_t num = 0;
     for (size_t i = 0; i < mNalUnits.size(); ++i) {
@@ -146,6 +168,10 @@ size_t HevcParameterSets::getSize(size_t index) {
     CHECK_LT(index, mNalUnits.size());
     return mNalUnits[index]->size();
 }
+size_t HevcParameterSets::getLayerId(size_t index) {
+    CHECK_LT(index, mNalLayerIds.size());
+    return mNalLayerIds[index];
+}
 
 bool HevcParameterSets::write(size_t index, uint8_t* dest, size_t size) {
     CHECK_LT(index, mNalUnits.size());
@@ -160,105 +186,193 @@ bool HevcParameterSets::write(size_t index, uint8_t* dest, size_t size) {
 }
 
 status_t HevcParameterSets::parseVps(const uint8_t* data, size_t size) {
+    size_t bitCounter = 0;
     // See Rec. ITU-T H.265 v3 (04/2015) Chapter 7.3.2.1 for reference
     NALBitReader reader(data, size);
     // Skip vps_video_parameter_set_id
     reader.skipBits(4);
-    // Skip vps_base_layer_internal_flag
-    reader.skipBits(1);
+    // vps_base_layer_internal_flag
+    bool baseLayerInternalFlag = reader.getBits(1);
     // Skip vps_base_layer_available_flag
     reader.skipBits(1);
-    // Skip vps_max_layers_minus_1
-    reader.skipBits(6);
-    // Skip vps_max_sub_layers_minus1
-    reader.skipBits(3);
+    // vps_max_layers_minus_1
+    // if the bitstream is for multiview profile, this value is set greater than 0.
+    uint8_t maxLayersMinusOne = reader.getBits(6);
+    mParams.add(kMaxLayersMinusOne, maxLayersMinusOne);
+    // vps_max_sub_layers_minus1
+    uint8_t maxSubLayersMinusOne;
+    maxSubLayersMinusOne = reader.getBits(3);
     // Skip vps_temporal_id_nesting_flags
     reader.skipBits(1);
     // Skip reserved
     reader.skipBits(16);
 
-    if (reader.atLeastNumBitsLeft(96)) {
-        mParams.add(kGeneralProfileSpace, reader.getBits(2));
-        mParams.add(kGeneralTierFlag, reader.getBits(1));
-        mParams.add(kGeneralProfileIdc, reader.getBits(5));
-        mParams.add(kGeneralProfileCompatibilityFlags, reader.getBits(32));
-        mParams.add(
-                kGeneralConstraintIndicatorFlags,
-                ((uint64_t)reader.getBits(16) << 32) | reader.getBits(32));
-        mParams.add(kGeneralLevelIdc, reader.getBits(8));
-        // 96 bits total for general profile.
-    } else {
-        reader.skipBits(96);
+    status_t err = parseProfileTierLevel(1, maxSubLayersMinusOne, reader, 1);
+    ALOGV("kMaxLayersMinus1 : %d", maxLayersMinusOne);
+    if (maxLayersMinusOne == 0) { // main(10) profile
+        mParams.add(kNumViews, 1);
+        if (err != OK) {
+            ALOGE("error parsing PTL in VPS");
+            return err;
+        }
+        ALOGV("PTL parsing correctly.");
+        return err;
+    }
+
+    // Additional parsing bits for more information
+    bool subLayerOrderingInfoPresentFlag;
+    subLayerOrderingInfoPresentFlag = reader.getBits(1);
+     // 129 bits read until this point
+    bitCounter += 129;
+    ALOGV("maxSubLayersMinusOne : %d", maxSubLayersMinusOne);
+    for (size_t i = (subLayerOrderingInfoPresentFlag? 0 : maxSubLayersMinusOne);
+            i <= maxSubLayersMinusOne; i++) {
+        //skip vps_max_dec_pic_buffering_minus1[i]
+        bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(&reader, 0U));
+        //skip vps_max_num_reorder_pics[i]
+        bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(&reader, 0U));
+        //skip vps_max_latency_increase_plus1[i]
+        bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(&reader, 0U));
+    }
+
+    uint8_t maxLayerId, numLayerSetsMinusOne;
+    // vps_max_layer_id
+    maxLayerId = reader.getBits(6); bitCounter += 6;
+    // vps_num_layer_sets_minus1
+    numLayerSetsMinusOne = parseUEWithFallback(&reader, 0U);
+    bitCounter += numBitsParsedExpGolomb(numLayerSetsMinusOne);
+    for (size_t i = 1; i <= numLayerSetsMinusOne; i++) {
+        for (size_t j = 0; j <= maxLayerId; j++) {
+            // Skip layer_id_included_flag[i][j]
+            reader.skipBits(1); bitCounter++;
+        }
+    }
+
+    // vps_timing_info_present_flag
+    bool timingInfoPresentFlag = reader.getBits(1); ++bitCounter;
+    if (timingInfoPresentFlag) {
+        // Skip vps_num_units_in_tick
+        reader.skipBits(32);
+        // skip vps_time_scale
+        reader.skipBits(32);
+        // vps_poc_proportional_to_timing_flag
+        bool pocProportionalToTimingFlag = reader.getBits(1);
+        bitCounter += 65;
+        if (pocProportionalToTimingFlag) {
+            // skip vps_num_ticks_poc_diff_one_minus1;
+            bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(&reader, 0U));
+        }
+        // skip vps_num_hrd_parameters
+        uint8_t numHrdParameters = parseUEWithFallback(&reader, 0U);
+        bitCounter += numBitsParsedExpGolomb(numHrdParameters);
+        for (size_t i = 0; i < numHrdParameters; i++) {
+            // skip hrd_layer_set_idx[i]
+            bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(&reader, 0U));
+            bool cprmsPresentFlag = false;
+            if (i > 0) {
+                // cprms_present_flag[i]
+                cprmsPresentFlag = reader.getBits(1); ++bitCounter;
+            }
+            err = parseHrdParameters(cprmsPresentFlag,
+                    maxSubLayersMinusOne, bitCounter, &reader);
+            if (err != OK) {
+                ALOGE("error parsing HRD Parameters");
+                return err;
+            }
+        }
+    }
+
+    bool extensionFlag = reader.getBits(1); ++bitCounter;
+    if (extensionFlag) {
+        while (!byteAligned(bitCounter)) {
+            // skip vps_extension_alignment_bit_equal_to_one
+            reader.skipBits(1); ++bitCounter;
+        }
+        status_t err = parseVpsExtension(kMaxLayersMinusOne,
+                            baseLayerInternalFlag, reader);
+        if (err != OK) {
+            ALOGE("error parsing VPS Extension.");
+            return err;
+        }
     }
 
     return reader.overRead() ? ERROR_MALFORMED : OK;
 }
-
-status_t HevcParameterSets::parseSps(const uint8_t* data, size_t size) {
+status_t HevcParameterSets::parseSps(const uint8_t *data, size_t size,
+        const uint8_t nuhLayerId) {
+    ALOGV("parseSPS, nuh_layer_id : %d", nuhLayerId);
     // See Rec. ITU-T H.265 v3 (04/2015) Chapter 7.3.2.2 for reference
     NALBitReader reader(data, size);
     // Skip sps_video_parameter_set_id
     reader.skipBits(4);
     uint8_t maxSubLayersMinus1 = reader.getBitsWithFallback(3, 0);
-    // Skip sps_temporal_id_nesting_flag;
-    reader.skipBits(1);
-    // Skip general profile
-    reader.skipBits(96);
-    if (maxSubLayersMinus1 > 0) {
-        bool subLayerProfilePresentFlag[8];
-        bool subLayerLevelPresentFlag[8];
-        for (int i = 0; i < maxSubLayersMinus1; ++i) {
-            subLayerProfilePresentFlag[i] = reader.getBitsWithFallback(1, 0);
-            subLayerLevelPresentFlag[i] = reader.getBitsWithFallback(1, 0);
-        }
-        // Skip reserved
-        reader.skipBits(2 * (8 - maxSubLayersMinus1));
-        for (int i = 0; i < maxSubLayersMinus1; ++i) {
-            if (subLayerProfilePresentFlag[i]) {
-                // Skip profile
-                reader.skipBits(88);
-            }
-            if (subLayerLevelPresentFlag[i]) {
-                // Skip sub_layer_level_idc[i]
-                reader.skipBits(8);
-            }
-        }
+    if (nuhLayerId == 0) {
+        mParams.add(kSpsMaxSubLayersMinusOne, maxSubLayersMinus1);
     }
+    // extOrMaxSubLayersMinus1 is defined in F.7.3.2.2.1
+    uint8_t extOrMaxSubLayersMinus1 = maxSubLayersMinus1;
+    const bool MultiLayerExtSpsFlag = nuhLayerId > 0 && extOrMaxSubLayersMinus1 == 7;
+    // additonal condition is defined in F.7.3.2.2.1
+    if (!MultiLayerExtSpsFlag) {
+        // sps_temporal_id_nesting_flag
+        reader.skipBits(1);
+        // Skip general profile
+        parseProfileTierLevel(1, mParams.valueFor(kSpsMaxSubLayersMinusOne), reader, false);
+    }
+
     // Skip sps_seq_parameter_set_id
     skipUE(&reader);
-    uint8_t chromaFormatIdc = parseUEWithFallback(&reader, 0);
-    mParams.add(kChromaFormatIdc, chromaFormatIdc);
-    if (chromaFormatIdc == 3) {
-        // Skip separate_colour_plane_flag
-        reader.skipBits(1);
+    if (MultiLayerExtSpsFlag) {
+        if (reader.getBitsWithFallback(1, 0) /*update_rep_format_flag*/) {
+            // sps_rep_format_idx
+            reader.skipBits(8);
+        }
+    } else {
+        uint8_t chromaFormatIdc = parseUEWithFallback(&reader, 0);
+        // FIXME : chroma_format_idc for each layer may be necessary
+        if (nuhLayerId == 0) {
+            mParams.add(kChromaFormatIdc, chromaFormatIdc);
+        }
+        if (chromaFormatIdc == 3) {
+            // Skip separate_colour_plane_flag
+            reader.skipBits(1);
+        }
+        // Skip pic_width_in_luma_samples
+        skipUE(&reader);
+        // Skip pic_height_in_luma_samples
+        skipUE(&reader);
+        if (reader.getBitsWithFallback(1, 0) /* i.e. conformance_window_flag */) {
+            // Skip conf_win_left_offset
+            skipUE(&reader);
+            // Skip conf_win_right_offset
+            skipUE(&reader);
+            // Skip conf_win_top_offset
+            skipUE(&reader);
+            // Skip conf_win_bottom_offset
+            skipUE(&reader);
+        }
+        if (nuhLayerId == 0) {
+            mParams.add(kBitDepthLumaMinus8, parseUEWithFallback(&reader, 0));
+            mParams.add(kBitDepthChromaMinus8, parseUEWithFallback(&reader, 0));
+        } else {
+            // FIXME : bit_depth_luma_minus8 and bit_depth_chroma_minus8
+            // for each layer may be necessary in the future
+            skipUE(&reader);
+            skipUE(&reader);
+        }
     }
-    // Skip pic_width_in_luma_samples
-    skipUE(&reader);
-    // Skip pic_height_in_luma_samples
-    skipUE(&reader);
-    if (reader.getBitsWithFallback(1, 0) /* i.e. conformance_window_flag */) {
-        // Skip conf_win_left_offset
-        skipUE(&reader);
-        // Skip conf_win_right_offset
-        skipUE(&reader);
-        // Skip conf_win_top_offset
-        skipUE(&reader);
-        // Skip conf_win_bottom_offset
-        skipUE(&reader);
-    }
-    mParams.add(kBitDepthLumaMinus8, parseUEWithFallback(&reader, 0));
-    mParams.add(kBitDepthChromaMinus8, parseUEWithFallback(&reader, 0));
 
     // log2_max_pic_order_cnt_lsb_minus4
     size_t log2MaxPicOrderCntLsb = parseUEWithFallback(&reader, 0) + (size_t)4;
-    bool spsSubLayerOrderingInfoPresentFlag = reader.getBitsWithFallback(1, 0);
-    for (uint32_t i = spsSubLayerOrderingInfoPresentFlag ? 0 : maxSubLayersMinus1;
-            i <= maxSubLayersMinus1; ++i) {
-        skipUE(&reader); // sps_max_dec_pic_buffering_minus1[i]
-        skipUE(&reader); // sps_max_num_reorder_pics[i]
-        skipUE(&reader); // sps_max_latency_increase_plus1[i]
+    if (!MultiLayerExtSpsFlag) {
+        bool spsSubLayerOrderingInfoPresentFlag = reader.getBitsWithFallback(1, 0);
+        for (uint32_t i = spsSubLayerOrderingInfoPresentFlag ? 0 : maxSubLayersMinus1;
+                i <= maxSubLayersMinus1; ++i) {
+            skipUE(&reader); // sps_max_dec_pic_buffering_minus1[i]
+            skipUE(&reader); // sps_max_num_reorder_pics[i]
+            skipUE(&reader); // sps_max_latency_increase_plus1[i]
+        }
     }
-
     skipUE(&reader); // log2_min_luma_coding_block_size_minus3
     skipUE(&reader); // log2_diff_max_min_luma_coding_block_size
     skipUE(&reader); // log2_min_luma_transform_block_size_minus2
@@ -266,20 +380,30 @@ status_t HevcParameterSets::parseSps(const uint8_t* data, size_t size) {
     skipUE(&reader); // max_transform_hierarchy_depth_inter
     skipUE(&reader); // max_transform_hierarchy_depth_intra
     if (reader.getBitsWithFallback(1, 0)) { // scaling_list_enabled_flag u(1)
-        // scaling_list_data
-        if (reader.getBitsWithFallback(1, 0)) { // sps_scaling_list_data_present_flag
-            for (uint32_t sizeId = 0; sizeId < 4; ++sizeId) {
-                for (uint32_t matrixId = 0; matrixId < 6; matrixId += (sizeId == 3) ? 3 : 1) {
-                    if (!reader.getBitsWithFallback(1, 1)) {
-                        // scaling_list_pred_mode_flag[sizeId][matrixId]
-                        skipUE(&reader); // scaling_list_pred_matrix_id_delta[sizeId][matrixId]
-                    } else {
-                        uint32_t coefNum = std::min(64, (1 << (4 + (sizeId << 1))));
-                        if (sizeId > 1) {
-                            skipSE(&reader); // scaling_list_dc_coef_minus8[sizeId − 2][matrixId]
-                        }
-                        for (uint32_t i = 0; i < coefNum; ++i) {
-                            skipSE(&reader); // scaling_list_delta_coef
+        bool inferScalingListFlag = false;
+        if (MultiLayerExtSpsFlag) {
+            // sps_infer_scaling_list_flag
+            inferScalingListFlag = reader.getBits(1);
+        }
+        if (inferScalingListFlag) {
+            // sps_scaling_list_ref_layer_id
+            reader.skipBits(6);
+        } else {
+            // scaling_list_data
+            if (reader.getBitsWithFallback(1, 0)) { // sps_scaling_list_data_present_flag
+                for (uint32_t sizeId = 0; sizeId < 4; ++sizeId) {
+                    for (uint32_t matrixId = 0; matrixId < 6; matrixId += (sizeId == 3) ? 3 : 1) {
+                        if (!reader.getBitsWithFallback(1, 1)) {
+                            // scaling_list_pred_mode_flag[sizeId][matrixId]
+                            skipUE(&reader); // scaling_list_pred_matrix_id_delta[sizeId][matrixId]
+                        } else {
+                            uint32_t coefNum = std::min(64, (1 << (4 + (sizeId << 1))));
+                            if (sizeId > 1) {
+                                skipSE(&reader); // scaling_list_dc_coef_minus8[sizeId − 2][matrixId]
+                            }
+                            for (uint32_t i = 0; i < coefNum; ++i) {
+                                skipSE(&reader); // scaling_list_delta_coef
+                            }
                         }
                     }
                 }
@@ -354,28 +478,30 @@ status_t HevcParameterSets::parseSps(const uint8_t* data, size_t size) {
         }
         if (reader.getBitsWithFallback(1, 0)) { // video_signal_type_present_flag
             reader.skipBits(3); // video_format
-            uint32_t videoFullRangeFlag;
-            if (reader.getBitsGraceful(1, &videoFullRangeFlag)) {
-                mParams.add(kVideoFullRangeFlag, videoFullRangeFlag);
-            }
-            if (reader.getBitsWithFallback(1, 0)) { // colour_description_present_flag
-                mInfo = (Info)(mInfo | kInfoHasColorDescription);
-                uint32_t colourPrimaries, transferCharacteristics, matrixCoeffs;
-                if (reader.getBitsGraceful(8, &colourPrimaries)) {
-                    mParams.add(kColourPrimaries, colourPrimaries);
+            if (nuhLayerId == 0) {
+                uint32_t videoFullRangeFlag;
+                if (reader.getBitsGraceful(1, &videoFullRangeFlag)) {
+                    mParams.add(kVideoFullRangeFlag, videoFullRangeFlag);
                 }
-                if (reader.getBitsGraceful(8, &transferCharacteristics)) {
-                    mParams.add(kTransferCharacteristics, transferCharacteristics);
-                    if (transferCharacteristics == 16 /* ST 2084 */
-                            || transferCharacteristics == 18 /* ARIB STD-B67 HLG */) {
-                        mInfo = (Info)(mInfo | kInfoIsHdr);
+                if (reader.getBitsWithFallback(1, 0)) { // colour_description_present_flag
+                    mInfo = (Info)(mInfo | kInfoHasColorDescription);
+                    uint32_t colourPrimaries, transferCharacteristics, matrixCoeffs;
+                    if (reader.getBitsGraceful(8, &colourPrimaries)) {
+                        mParams.add(kColourPrimaries, colourPrimaries);
+                    }
+                    if (reader.getBitsGraceful(8, &transferCharacteristics)) {
+                        mParams.add(kTransferCharacteristics, transferCharacteristics);
+                        if (transferCharacteristics == 16 /* ST 2084 */
+                                || transferCharacteristics == 18 /* ARIB STD-B67 HLG */) {
+                            mInfo = (Info)(mInfo | kInfoIsHdr);
+                        }
+                    }
+                    if (reader.getBitsGraceful(8, &matrixCoeffs)) {
+                        mParams.add(kMatrixCoeffs, matrixCoeffs);
                     }
                 }
-                if (reader.getBitsGraceful(8, &matrixCoeffs)) {
-                    mParams.add(kMatrixCoeffs, matrixCoeffs);
-                }
+                // skip rest of VUI
             }
-            // skip rest of VUI
         }
     }
 
@@ -431,12 +557,237 @@ void HevcParameterSets::FindHEVCDimensions(const sp<ABuffer> &SpsBuffer, int32_t
 }
 
 status_t HevcParameterSets::parsePps(
-        const uint8_t* data UNUSED_PARAM, size_t size UNUSED_PARAM) {
+        const uint8_t* data UNUSED_PARAM, size_t size UNUSED_PARAM,
+        const uint8_t nuhLayerId) {
+    ALOGV("parse PPS, nuh_layer_id : %d", nuhLayerId);
     return OK;
 }
 
-status_t HevcParameterSets::makeHvcc(uint8_t *hvcc, size_t *hvccSize,
-        size_t nalSizeLength) {
+status_t HevcParameterSets::parseProfileTierLevel(const bool profilePresentFlag, uint8_t maxNumSubLayersMinus1, NALBitReader& reader,
+                                                const bool isInVps) {
+    ALOGV("parseProfileTierLevel()");
+    size_t count = 0;
+    if (profilePresentFlag) {
+        if (isInVps && reader.atLeastNumBitsLeft(88)) {
+            mParams.add(kGeneralProfileSpace, reader.getBits(2));
+            mParams.add(kGeneralTierFlag, reader.getBits(1));
+            mParams.add(kGeneralProfileIdc, reader.getBits(5));
+            mParams.add(kGeneralProfileCompatibilityFlags, reader.getBits(32));
+            mParams.add(
+                    kGeneralConstraintIndicatorFlags,
+                    ((uint64_t)reader.getBits(16) << 32) | reader.getBits(32));
+        }
+    }
+
+    if (isInVps) {
+        // general_level_idc
+        mParams.add(kGeneralLevelIdc, reader.getBits(8));
+        // If the bitstream is the main(main10) profile, the syntax elements below are not necessary for hvcc box.
+        // Otherwise, if the bitstream is multiview profile, the max_sub_layers_minus1 would be set to 0,
+        // which means that there is no further syntax element to be parsed from this point.
+        return reader.overRead() ? ERROR_MALFORMED : OK;
+    } else {
+        // general profile / tier information
+        if (profilePresentFlag) {
+            reader.skipBits(88);
+        }
+        // general_level_idc
+        reader.skipBits(8);
+    }
+
+    bool subLayerProfilePresentFlag[8];
+    bool subLayerLevelPresentFlag[8];
+    for (int i = 0; i < maxNumSubLayersMinus1; ++i) {
+        subLayerProfilePresentFlag[i] = reader.getBits(1);
+        subLayerLevelPresentFlag[i] = reader.getBits(1);
+    }
+    // Skip
+    if (maxNumSubLayersMinus1 > 0) {
+        reader.skipBits(2 * (8 - maxNumSubLayersMinus1));
+    }
+    for (int i = 0; i < maxNumSubLayersMinus1; ++i) {
+        if (subLayerProfilePresentFlag[i]) {
+            // Skip profile
+            reader.skipBits(88);
+        }
+        if (subLayerLevelPresentFlag[i]) {
+            // Skip sub_layer_level_idc[i]
+            reader.skipBits(8);
+        }
+    }
+
+    return reader.overRead() ? ERROR_MALFORMED : OK;
+}
+status_t HevcParameterSets::parseHrdParameters(const bool cprmsPresentFlag, uint8_t maxNumSubLayersMinus1, size_t &bitCounter, NALBitReader* reader) {
+    bool nalHrdParamPresentFlag=0, vclHrdParamPresentFlag=0, subPicHrdParamsPresentFlag = 0;
+    if (cprmsPresentFlag) {
+        // nal_hrd_parameters_present_flag
+        nalHrdParamPresentFlag = reader->getBits(1);
+        // vcl_hrd_parameters_present_flag
+        vclHrdParamPresentFlag = reader->getBits(1);
+        bitCounter += 2;
+
+        if (nalHrdParamPresentFlag || vclHrdParamPresentFlag) {
+            // sub_pic_hrd_params_present_flag
+            subPicHrdParamsPresentFlag = reader->getBits(1); ++bitCounter;
+            if (subPicHrdParamsPresentFlag) {
+                // Skip tick_divisor_minus2
+                reader->skipBits(8);
+                // Skip du_cpb_removal_delay_increment_length_minus1
+                reader->skipBits(5);
+                // Skip sub_pic_cpb_params_in_pic_timing_sei_flag
+                reader->skipBits(1);
+                // Skip dpb_output_delay_du_length_minus1
+                reader->skipBits(5);
+                bitCounter += 19;
+            }
+            // Skip bit_rate_scale
+            reader->skipBits(4);
+            // Skip cpb_size_scale
+            reader->skipBits(4);
+            if (subPicHrdParamsPresentFlag) {
+                // Skip cbp_size_du_scale
+                reader->skipBits(4);
+                bitCounter += 4;
+            }
+            // Skip initial_cpb_removal_delay_length_minus1
+            reader->skipBits(5);
+            // Skip au_cpb_removal_delay_length_minus1
+            reader->skipBits(5);
+            // Skip dpb_output_delay_length_minus1
+            reader->skipBits(5);
+            bitCounter += 23;
+        }
+    }
+
+    for (size_t i = 0; i <= maxNumSubLayersMinus1; i++) {
+        uint8_t cpbCntMinus1=0;
+        bool fixedPicRateGeneralFlag = 0, fixedPicRateWithinCvsFlag = 0, lowDelayHrdFlag = 0;
+        // fixed_pic_rate_general_flag[i]
+        fixedPicRateGeneralFlag = reader->getBits(1); ++bitCounter;
+        if (!fixedPicRateGeneralFlag) {
+            // fixed_pic_rate_within_cvs_flag[i]
+            fixedPicRateWithinCvsFlag = reader->getBits(1); ++bitCounter;
+        }
+        if ( fixedPicRateWithinCvsFlag) {
+            // Skip elemental_duration_in_tc_minus1[i]
+            bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(reader, 0U));
+        } else {
+            // low_delay_hrd_flag[i]
+            lowDelayHrdFlag = reader->getBits(1); ++bitCounter;
+        }
+        if (!lowDelayHrdFlag) {
+            // Skip cpb_cnt_minus1[i]
+            cpbCntMinus1 = parseUEWithFallback(reader, 0U);
+            bitCounter += numBitsParsedExpGolomb(cpbCntMinus1);
+        }
+        if (nalHrdParamPresentFlag) {
+            status_t err = parseSubLayerHrdParameters(subPicHrdParamsPresentFlag, cpbCntMinus1, bitCounter, reader);
+            if (err != OK) {
+                ALOGE("error parsing Sub layer HRD Parameters (NAL)");
+                return err;
+            }
+        }
+        if (vclHrdParamPresentFlag) {
+            status_t err = parseSubLayerHrdParameters(subPicHrdParamsPresentFlag, cpbCntMinus1, bitCounter, reader);
+            if (err != OK) {
+                ALOGE("error parsing Sub layer HRD Parameters (VCL)");
+                return err;
+            }
+        }
+    }
+    return reader->overRead() ? ERROR_MALFORMED : OK;
+}
+status_t HevcParameterSets::parseSubLayerHrdParameters(const bool subPicHrdParamsPresentFlag, const uint8_t cpbCntMinus1, size_t &bitCounter, NALBitReader *reader) {
+    uint8_t cpbCnt = cpbCntMinus1 + 1;
+    for (size_t i = 0; i < cpbCnt; i++) {
+        // Skip bit_rate_value_minus1[i]
+        bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(reader, 0U));
+        // Skip cpb_size_value_minus1[i]
+        bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(reader, 0U));
+        if (subPicHrdParamsPresentFlag) {
+            // Skip cpb_size_du_value_minus1[i]
+            bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(reader, 0U));
+            // Skip bit_rate_du_value_minus1[i]
+            bitCounter += numBitsParsedExpGolomb(parseUEWithFallback(reader, 0U));
+        }
+        // Skip cbr_flag[i]
+        reader->skipBits(1);
+        ++bitCounter;
+    }
+    return reader->overRead() ? ERROR_MALFORMED : OK;
+}
+status_t HevcParameterSets::parseVpsExtension(const uint8_t maxLayersMinus1, const bool baseLayerInternalFlag, NALBitReader& reader) {
+    if (maxLayersMinus1 > 0 && baseLayerInternalFlag) {
+        parseProfileTierLevel(0, 0, reader, 0);
+    }
+    bool splittingFlag = reader.getBits(1);
+
+    bool scalabilityMaskFlag[16];
+    uint8_t numScalabilityTypes = 0;
+    for (size_t i = 0; i < 16; i++) {
+        scalabilityMaskFlag[i] = reader.getBits(1);
+        numScalabilityTypes += scalabilityMaskFlag[i];
+    }
+    uint8_t dimensionIdLenMinus1[16];
+    for (size_t j = 0; j < (numScalabilityTypes - splittingFlag); j++) {
+        dimensionIdLenMinus1[j] = reader.getBits(3);
+    }
+    //vps_nuh_layer_id_present_flag
+    bool nuhLayerIdPresentFlag = reader.getBits(1);
+    uint8_t MaxLayersMinus1 = std::min((uint8_t)62, maxLayersMinus1);
+    uint8_t layerIdInNuh[62];
+    uint8_t dimensionId[62][16];
+    for (size_t i = 1; i <= MaxLayersMinus1; i++) {
+        if (nuhLayerIdPresentFlag) {
+            layerIdInNuh[i] = reader.getBits(6);
+        }
+        if (!splittingFlag) {
+            for (size_t j = 0; j < numScalabilityTypes; j++) {
+                dimensionId[i][j] = reader.getBits(dimensionIdLenMinus1[j] + 1);
+            }
+        }
+    }
+    // derive NumViews (please refer to dimension_id[i] semantic for more details.)
+    uint8_t NumViews = 1;
+    uint8_t ScalabilityId[62][16], ViewOrderIdx[62]; //  DepthLayerFlag[62], DependencyId[62], AuxId[62];
+    for (size_t i = 0; i <= MaxLayersMinus1; i++) {
+        uint8_t lId = layerIdInNuh[i];
+        for (size_t smIdx=0, j=0; smIdx < 16; smIdx++) {
+            if (scalabilityMaskFlag[smIdx]) {
+                ScalabilityId[i][smIdx] = dimensionId[i][j++];
+            } else {
+                ScalabilityId[i][smIdx] = 0;
+            }
+        }
+        // DepthLayerFlag[lId] = ScalabilityId[i][0];
+         ViewOrderIdx[lId] = ScalabilityId[i][1];
+        // DependencyId[lId] = ScalabilityId[i][2];
+        // AuxId[lId] = ScalabilityId[i][3];
+        if (i > 0) {
+            uint8_t newViewFlag = 1;
+            for (size_t j = 0; j < i; j++) {
+                if (ViewOrderIdx[lId] == ViewOrderIdx[layerIdInNuh[j]]) {
+                    newViewFlag = 0;
+                }
+            }
+            NumViews += newViewFlag;
+        }
+    }
+    mParams.add(kNumViews, NumViews);
+
+    return reader.overRead() ? ERROR_MALFORMED : OK;
+}
+size_t HevcParameterSets::numBitsParsedExpGolomb(uint8_t symbol) {
+    uint8_t value = symbol + 1;
+    size_t counter = 0;
+    while (value != 0) {
+        ++counter;
+        value >>= 1;
+    }
+    return counter * 2 - 1;
+}
+status_t HevcParameterSets::makeHvcc(uint8_t *hvcc, size_t *hvccSize, size_t nalSizeLength) {
     if (hvcc == NULL || hvccSize == NULL
             || (nalSizeLength != 4 && nalSizeLength != 2)) {
         return BAD_VALUE;
@@ -454,7 +805,7 @@ status_t HevcParameterSets::makeHvcc(uint8_t *hvcc, size_t *hvccSize,
         ++numOfArrays;
         size += 3;
         for (size_t j = 0; j < numNalUnits; ++j) {
-            if (getType(j) != type) {
+            if (getType(j) != type || getLayerId(j) != 0) {
                 continue;
             }
             size += 2 + getSize(j);
@@ -518,7 +869,7 @@ status_t HevcParameterSets::makeHvcc(uint8_t *hvcc, size_t *hvccSize,
     header += 23;
     for (size_t i = 0; i < ARRAY_SIZE(kHevcNalUnitTypes); ++i) {
         uint8_t type = kHevcNalUnitTypes[i];
-        size_t numNalus = getNumNalUnitsOfType(type);
+        size_t numNalus = getNumNalUnitsOfType(type, 0);
         if (numNalus == 0) {
             continue;
         }
@@ -528,7 +879,7 @@ status_t HevcParameterSets::makeHvcc(uint8_t *hvcc, size_t *hvccSize,
         header[2] = numNalus & 0xff;
         header += 3;
         for (size_t j = 0; j < numNalUnits; ++j) {
-            if (getType(j) != type) {
+            if (getType(j) != type || getLayerId(j) != 0) {
                 continue;
             }
             header[0] = (getSize(j) >> 8) & 0xff;
@@ -540,10 +891,165 @@ status_t HevcParameterSets::makeHvcc(uint8_t *hvcc, size_t *hvccSize,
         }
     }
     CHECK_EQ(header - size, hvcc);
+    return OK;
+}
+status_t HevcParameterSets::makeLhvc(uint8_t *lhvc, size_t *lhvcSize,
+        size_t nalSizeLength) {
+    ALOGV("makeLhvc() start");
+    if (lhvc == NULL || lhvcSize == NULL
+            || (nalSizeLength != 4 && nalSizeLength != 2)) {
+        ALOGE("nalSizeLength error");
+        return BAD_VALUE;
+    }
+    // ISO 14496-15: HEVC file format
+    size_t size = 6;  // 6 bytes in the header
+    size_t numOfArrays = 0;
+    const size_t numNalUnits = getNumNalUnits();
+    for (size_t i = 0; i < ARRAY_SIZE(kHevcNalUnitTypes); ++i) {
+        uint8_t type = kHevcNalUnitTypes[i];
+        size_t numNalus = getNumNalUnitsOfType(type, 1);
+        if (numNalus == 0) {
+            continue;
+        }
+        ++numOfArrays;
+        size += 3;
+        for (size_t j = 0; j < numNalUnits; ++j) {
+            if (getType(j) != type || getLayerId(j) != 1) {
+                continue;
+            }
+            size += 2 + getSize(j);
+        }
+    }
 
+    if (size > *lhvcSize) {
+        ALOGE("size : %d, numNalus : %d", size, numNalUnits);
+        return NO_MEMORY;
+    }
+    *lhvcSize = size;
+
+    uint8_t *header = lhvc;
+    header[0] = 1;
+    // FIXME: derive parallelismType properly.
+    header[1] = 0xf0;
+    header[2] = 0x00;
+    // FIXME: derive parallelismType properly.
+    header[3] = 0xfc;
+    // FIXME: derive numTemporalLayers, temporalIdNested properly.
+    header[4] = 0xc8 | (nalSizeLength -1);
+    header[5] = numOfArrays;
+    header += 6;
+    for (size_t i = 0; i < ARRAY_SIZE(kHevcNalUnitTypes); ++i) {
+        uint8_t type = kHevcNalUnitTypes[i];
+        // Suppose only stereo video is available (2-view only)
+        size_t numNalus = getNumNalUnitsOfType(type, 1);
+        if (numNalus == 0) {
+            continue;
+        }
+        // array_completeness set to 1.
+        header[0] = type | 0x80;
+        header[1] = (numNalus >> 8) & 0xff;
+        header[2] = numNalus & 0xff;
+        header += 3;
+        for (size_t j = 0; j < numNalUnits; ++j) {
+            if (getType(j) != type || getLayerId(j) != 1) {
+                continue;
+            }
+            header[0] = (getSize(j) >> 8) & 0xff;
+            header[1] = getSize(j) & 0xff;
+            if (!write(j, header + 2, size - (header - (uint8_t *)lhvc))) {
+                return NO_MEMORY;
+            }
+            header += (2 + getSize(j));
+        }
+    }
+    CHECK_EQ(header - size, lhvc);
     return OK;
 }
 
+void HevcParameterSets::makeStri(uint8_t *stri) {
+    ALOGV("makeStri()");
+    // Please refer to Stereo-video-isobmff-extensions for details.
+    uint8_t *header = stri;
+    // unsigned int(4) reserved
+    *header = 0;
+    // FIXME : unsigned int(1) eye_views_reversed - device-dependent information should be included
+    // unsigned int(1) has_additional_views = 0
+    // unsinged int(1) has_right_eye_view = 1
+    // unsigned int(1) has_left_eye_view = 1
+    *header |= 0x03;
+    ALOGV("stri : %#04x", *stri);
+}
+
+status_t HevcParameterSets::makeHero(uint8_t *hero) {
+    ALOGV("makeHero()");
+
+    // Please refer to Stereo-video-isobmff-extensions for details.
+    uint8_t leftViewId;
+    if (!findParam8(kSeiLeftViewId, &leftViewId)) {
+        *hero = 0; // meaning none
+    } else {
+        if(leftViewId == 0) {
+            *hero = 1; // left view is the hero
+        } else if (leftViewId == 1) {
+            *hero = 2; // right view is the hero
+        } else {
+            return ERROR_MALFORMED;
+        }
+    }
+
+    ALOGV("hero : %#04x", *hero);
+    return OK;
+}
+status_t HevcParameterSets::parseSeiMessage(const uint8_t *data, size_t size) {
+    uint32_t payloadType = 0;
+    uint32_t payloadSize = 0;
+    size_t byteRead = 0;
+    status_t err = OK;
+    while (data[0] == 0xff) {
+        payloadType += 255;
+        ++byteRead;
+        ++data;
+    }
+    payloadType += data[0];
+    ++data;
+    ++byteRead;
+    while (data[0] == 0xff) {
+        payloadSize += 255;
+        ++byteRead;
+        ++data;
+    }
+    payloadSize += data[0];
+    ++data;
+    ++byteRead;
+
+    if (payloadType == 176) { // three dimensional reference info SEI
+        err = parseThreeDimensionalReferenceInfoSei(data, size - byteRead);
+    }
+    return err;
+}
+status_t HevcParameterSets::parseThreeDimensionalReferenceInfoSei(const uint8_t *data, size_t size) {
+    ALOGV("three-dimensional reference displays info()");
+
+    NALBitReader reader(data, size);
+    // prec_ref_display_width
+    uint32_t prec_ref_display_width = parseUEWithFallback(&reader, 0U);
+
+    if (reader.getBits(1)) { // ref_viewing_distance_flag
+        parseUEWithFallback(&reader, 0U);
+    }
+    uint8_t numRefDisp = parseUEWithFallback(&reader, 0U); // num_ref_displays_minus1
+    if (numRefDisp) {
+        // FIXME : Currenly only stereo video is allowed.
+        return ERROR_MALFORMED;
+    }
+    for (uint8_t i = 0; i<=numRefDisp; ++i) {
+        uint8_t leftViewId = parseUEWithFallback(&reader, 0U); // left_view_id[i]
+        // if left_view_id[i] is 0, left view is primary,
+        // otherwise a right view video is a base view.
+        mParams.add(kSeiLeftViewId, leftViewId);
+    }
+    return OK;
+}
 bool HevcParameterSets::IsHevcIDR(const uint8_t *data, size_t size) {
     bool foundIDR = false;
     const uint8_t *nalStart;
@@ -555,7 +1061,7 @@ bool HevcParameterSets::IsHevcIDR(const uint8_t *data, size_t size) {
         }
 
         uint8_t nalType = (nalStart[0] & 0x7E) >> 1;
-        switch(nalType) {
+        switch (nalType) {
             case kHevcNalUnitTypeCodedSliceIdr:
             case kHevcNalUnitTypeCodedSliceIdrNoLP:
             case kHevcNalUnitTypeCodedSliceCra:
@@ -565,5 +1071,13 @@ bool HevcParameterSets::IsHevcIDR(const uint8_t *data, size_t size) {
     }
 
     return foundIDR;
+}
+// indicates whether the current bitstream is mv-hevc bitstream
+bool HevcParameterSets::IsMvHevc() {
+    uint8_t numViews = 1;
+    if (findParam8(kNumViews, &numViews)) {
+        return numViews > 1;
+    }
+    return false;
 }
 }  // namespace android

@@ -741,7 +741,8 @@ C2Mapper::GetProfileLevelMapper(std::string mediaType) {
         return std::make_shared<DolbyVisionProfileLevelMapper>();
     } else if (mediaType == MIMETYPE_VIDEO_H263) {
         return std::make_shared<H263ProfileLevelMapper>();
-    } else if (mediaType == MIMETYPE_VIDEO_HEVC) {
+    } else if (mediaType == MIMETYPE_VIDEO_HEVC ||
+                mediaType == MIMETYPE_VIDEO_MVHEVC) {
         return std::make_shared<HevcProfileLevelMapper>();
     } else if (mediaType == MIMETYPE_VIDEO_MPEG2) {
         return std::make_shared<Mpeg2ProfileLevelMapper>();

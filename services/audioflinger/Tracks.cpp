@@ -562,6 +562,7 @@ void AudioFlinger::PlaybackThread::OpPlayAudioMonitor::onFirstRef()
     // make sure not to broadcast the initial state since it is not needed and could
     // cause a deadlock since this method can be called with the mThread->mLock held
     checkPlayAudioForUsage(/*doBroadcast=*/false);
+
     if (mAttributionSource.packageName.has_value()) {
         mOpCallback = new PlayAudioOpCallback(this);
         mAppOpsManager.startWatchingMode(AppOpsManager::OP_PLAY_AUDIO,
