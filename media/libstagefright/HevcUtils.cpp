@@ -236,6 +236,9 @@ status_t HevcParameterSets::parseVps(const uint8_t* data, size_t size) {
     }
 
     uint8_t maxLayerId, numLayerSetsMinusOne;
+    if (!reader.atLeastNumBitsLeft(6)) {
+        return ERROR_MALFORMED;
+    }
     // vps_max_layer_id
     maxLayerId = reader.getBits(6); bitCounter += 6;
     // vps_num_layer_sets_minus1
